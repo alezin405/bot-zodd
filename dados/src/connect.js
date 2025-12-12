@@ -187,7 +187,7 @@ async function generateQRCode() {
 
 async function main() {
     try {
-        setupGracefulShutdown();
+        
         await checkPrerequisites();
         await setupTermuxAutostart();
 
