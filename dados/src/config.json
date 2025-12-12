@@ -1,10 +1,8 @@
 {
-  "prefixo": "/",
-  "nomebot": "ZoddBot",
-  "nomedono": "zodd",
-  "numerodono": "555191297601",
-  "autoread": true,
-  "anticall": true,
-  "antipv": false,
-  "self": false
+  "ownerName": "zodd",
+  "ownerNumber": "555191297601",
+  "prefix": "/",
+  "language": "pt",
+  "mode": "private",
+  "numerodono": "555191297601"
 }
