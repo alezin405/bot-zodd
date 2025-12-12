@@ -272,7 +272,7 @@ async function main() {
       mensagem('📷 Sessão de QR Code detectada. Conectando automaticamente...');
       startBot(false);
     } else {
-      startBot(true); // inicia direto com QR
+      startBot(false); // inicia direto com QR
       
     }
   } catch (error) {
