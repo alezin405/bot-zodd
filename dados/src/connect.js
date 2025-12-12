@@ -1,173 +1,203 @@
-import a, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } from 'whaileys';
-const makeWASocket = a.default;
-import { Boom } from '@hapi/boom';
-import NodeCache from 'node-cache';
-import readline from 'readline';
-import pino from 'pino';
 import fs from 'fs/promises';
-import path, { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
-import crypto from 'crypto';
-import axios from 'axios';
-
-import PerformanceOptimizer from './utils/performanceOptimizer.js';
-import RentalExpirationManager from './utils/rentalExpirationManager.js';
-import { loadMsgBotOn } from './utils/database.js';
-import { buildUserId } from './utils/helpers.js';
-
-// Necessário para salvar QR
+import fsSync from 'fs';
+import path from 'path';
+import { spawn } from 'child_process';
+import readline from 'readline';
+import os from 'os';
 import qrcode from 'qrcode-terminal';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+const CONFIG_PATH = path.join(process.cwd(), 'dados', 'src', 'config.json');
+const NODE_MODULES_PATH = path.join(process.cwd(), 'node_modules');
+const QR_CODE_DIR = path.join(process.cwd(), 'dados', 'database', 'qr-code');
+const CONNECT_FILE = path.join(process.cwd(), 'dados', 'src', 'connect.js');
+const isWindows = os.platform() === 'win32';
+const isTermux = fsSync.existsSync('/data/data/com.termux');
 
-// Diretório onde o QR será salvo
-const QR_DIR = path.join(__dirname, "..", "database", "qr-code");
+const colors = {
+    reset: '\x1b[0m',
+    green: '\x1b[1;32m',
+    red: '\x1b[1;31m',
+    blue: '\x1b[1;34m',
+    yellow: '\x1b[1;33m',
+    cyan: '\x1b[1;36m',
+    bold: '\x1b[1m',
+};
 
-let baileysVersionCache = null;
-let baileysVersionCacheTime = 0;
-const BAILEYS_VERSION_CACHE_TTL = 60 * 60 * 1000;
+const mensagem = (text) => console.log(`${colors.green}${text}${colors.reset}`);
+const aviso = (text) => console.log(`${colors.red}${text}${colors.reset}`);
+const info = (text) => console.log(`${colors.cyan}${text}${colors.reset}`);
+const separador = () => console.log(`${colors.blue}============================================${colors.reset}`);
 
-async function fetchBaileysVersionFromGitHub() {
-    const now = Date.now();
-    if (baileysVersionCache && (now - baileysVersionCacheTime) < BAILEYS_VERSION_CACHE_TTL) {
-        return baileysVersionCache;
-    }
+const getVersion = () => {
     try {
-        const response = await axios.get('https://raw.githubusercontent.com/WhiskeySockets/Baileys/refs/heads/master/src/Defaults/baileys-version.json');
-        baileysVersionCache = { version: response.data.version };
-        baileysVersionCacheTime = now;
-        return baileysVersionCache;
+        const packageJson = JSON.parse(fsSync.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8'));
+        return packageJson.version || 'Desconhecida';
     } catch {
-        const fallback = await fetchLatestBaileysVersion();
-        baileysVersionCache = fallback;
-        baileysVersionCacheTime = now;
-        return fallback;
+        return 'Desconhecida';
     }
-}
+};
 
-class MessageQueue {
-    constructor(maxWorkers = 4, batchSize = 10, messagesPerBatch = 2) {
-        this.queue = [];
-        this.maxWorkers = maxWorkers;
-        this.batchSize = batchSize;
-        this.messagesPerBatch = messagesPerBatch;
-        this.activeWorkers = 0;
-        this.isProcessing = false;
-        this.stats = {
-            totalProcessed: 0,
-            totalErrors: 0,
-            startTime: Date.now(),
-        };
+let botProcess = null;
+const version = getVersion();
+
+async function setupTermuxAutostart() {
+    if (!isTermux) {
+        info('📱 Não está rodando no Termux. Ignorando configuração de autostart.');
+        return;
     }
 
-    async add(message, processor) {
-        return new Promise((resolve, reject) => {
-            this.queue.push({ message, processor, resolve, reject });
-            if (!this.isProcessing) this.startProcessing();
-        });
-    }
-
-    startProcessing() {
-        if (this.isProcessing) return;
-        this.isProcessing = true;
-        this.processQueue();
-    }
-
-    async processQueue() {
-        while (this.isProcessing && this.queue.length > 0) {
-            const batch = this.queue.splice(0, this.messagesPerBatch);
-            await Promise.all(batch.map(item => item.processor(item.message).then(item.resolve).catch(item.reject)));
-        }
-        this.isProcessing = false;
-    }
-}
-
-const messageQueue = new MessageQueue(8, 10, 2);
-
-const configPath = path.join(__dirname, "config.json");
-let config;
-
-try {
-    config = JSON.parse(await fs.readFile(configPath, "utf8"));
-} catch (err) {
-    console.error("Erro ao carregar config:", err);
-    process.exit(1);
-}
-
-const indexModule = (await import('./index.js')).default ?? (await import('./index.js'));
-
-const performanceOptimizer = new PerformanceOptimizer();
-const rentalExpirationManager = new RentalExpirationManager(null, {
-    checkInterval: '0 */6 * * *',
-    warningDays: 3,
-    finalWarningDays: 1,
-    cleanupDelayHours: 24,
-    enableNotifications: true,
-    enableAutoCleanup: true,
-});
-
-const logger = pino({ level: 'silent' });
-const AUTH_DIR = path.join(__dirname, '..', 'database', 'qr-code');
-
-// ------------ 🔧 FUNÇÃO PRINCIPAL DO BOT ------------
-async function createBotSocket(authDir) {
-    const { state, saveCreds } = await useMultiFileAuthState(authDir);
-
-    const { version } = await fetchBaileysVersionFromGitHub();
-
-    const Sock = makeWASocket({
-        version,
-        logger,
-        printQRInTerminal: false, // ⚠️ Não mostrar QR no terminal
-        auth: {
-            creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, NodeCache)
-        },
-        browser: ['Ubuntu', 'Chrome', '20.0.04'],
-        syncFullHistory: false
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
     });
 
-    Sock.ev.on('creds.update', saveCreds);
+    const answer = await rl.question(`${colors.yellow}📱 Detectado ambiente Termux. Deseja configurar inicialização automática? (s/n): ${colors.reset}`);
+    rl.close();
 
-    Sock.ev.on('connection.update', async update => {
-        const { connection, lastDisconnect, qr } = update;
+    if (answer.trim().toLowerCase() !== 's') {
+        info('📱 Configuração de autostart ignorada pelo usuário.');
+        return;
+    }
 
-        // ------------------ ⚠️ QR Code editado aqui ------------------
-        if (qr && !Sock.authState.creds.registered && !config.codeMode) {
-            try {
-                await fs.mkdir(QR_DIR, { recursive: true });
+    info('📱 Configurando inicialização automática no Termux...');
 
-                const qrFile = path.join(QR_DIR, "qr.txt");
-
-                await fs.writeFile(qrFile, qr, "utf8");
-
-                console.log("📄 QR CODE GERADO E SALVO EM:");
-                console.log(qrFile);
-                console.log("➡️ Baixe esse arquivo no Koyeb e me envie aqui para gerar a imagem do QR.");
-            } catch (e) {
-                console.error("❌ Erro ao salvar QR:", e.message);
-            }
+    try {
+        const termuxProperties = path.join(process.env.HOME, '.termux', 'termux.properties');
+        await fs.mkdir(path.dirname(termuxProperties), { recursive: true });
+        if (!fsSync.existsSync(termuxProperties)) {
+            await fs.writeFile(termuxProperties, '');
         }
-        // -------------------------------------------------------------
+        execSync(`sed '/^# *allow-external-apps *= *true/s/^# *//' ${termuxProperties} -i && termux-reload-settings`, { stdio: 'inherit' });
+        mensagem('📝 Configuração de termux.properties concluída.');
 
-        if (connection === "open") {
-            console.log("Bot conectado!");
+        const bashrcPath = path.join(process.env.HOME, '.bashrc');
+        const termuxServiceCommand = `
+am startservice --user 0 \\
+  -n com.termux/com.termux.app.RunCommandService \\
+  -a com.termux.RUN_COMMAND \\
+  --es com.termux.RUN_COMMAND_PATH '/data/data/com.termux/files/usr/bin/npm' \\
+  --esa com.termux.RUN_COMMAND_ARGUMENTS 'start' \\
+  --es com.termux.RUN_COMMAND_SESSION_NAME ' Bot' \\
+  --es com.termux.RUN_COMMAND_WORKDIR '${path.join(process.cwd())}' \\
+  --ez com.termux.RUN_COMMAND_BACKGROUND 'false' \\
+  --es com.termux.RUN_COMMAND_SESSION_ACTION '0'
+`.trim();
+
+        let bashrcContent = '';
+        if (fsSync.existsSync(bashrcPath)) {
+            bashrcContent = await fs.readFile(bashrcPath, 'utf8');
         }
 
-        if (connection === "close") {
-            const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
-            console.log("Conexão fechada, tentando reconectar...");
-            await createBotSocket(AUTH_DIR);
+        if (!bashrcContent.includes(termuxServiceCommand)) {
+            await fs.appendFile(bashrcPath, `\n${termuxServiceCommand}\n`);
+            mensagem('📝 Comando am startservice adicionado ao ~/.bashrc');
+        } else {
+            info('📝 Comando am startservice já presente no ~/.bashrc');
         }
+
+        mensagem('📱 Configuração de inicialização automática no Termux concluída!');
+    } catch (error) {
+        aviso(`❌ Erro ao configurar autostart no Termux: ${error.message}`);
+    }
+}
+
+async function checkPrerequisites() {
+    if (!fsSync.existsSync(CONFIG_PATH)) {
+        aviso('⚠️ Arquivo de configuração (config.json) não encontrado! Iniciando configuração automática...');
+        try {
+            await new Promise((resolve, reject) => {
+                const configProcess = spawn('npm', ['run', 'config'], { stdio: 'inherit', shell: isWindows });
+                configProcess.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`Configuração falhou com código ${code}`))));
+                configProcess.on('error', reject);
+            });
+            mensagem('📝 Configuração concluída com sucesso!');
+        } catch (error) {
+            aviso(`❌ Falha na configuração: ${error.message}`);
+            mensagem('📝 Tente executar manualmente: npm run config');
+            process.exit(1);
+        }
+    }
+
+    if (!fsSync.existsSync(NODE_MODULES_PATH)) {
+        aviso('⚠️ Módulos do Node.js não encontrados! Iniciando instalação automática...');
+        try {
+            await new Promise((resolve, reject) => {
+                const installProcess = spawn('npm', ['run', 'config:install'], { stdio: 'inherit', shell: isWindows });
+                installProcess.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`Instalação falhou com código ${code}`))));
+                installProcess.on('error', reject);
+            });
+            mensagem('📦 Instalação dos módulos concluída com sucesso!');
+        } catch (error) {
+            aviso(`❌ Falha na instalação dos módulos: ${error.message}`);
+            mensagem('📦 Tente executar manualmente: npm run config:install');
+            process.exit(1);
+        }
+    }
+
+    if (!fsSync.existsSync(CONNECT_FILE)) {
+        aviso(`⚠️ Arquivo de conexão (${CONNECT_FILE}) não encontrado!`);
+        aviso('🔍 Verifique a instalação do projeto.');
+        process.exit(1);
+    }
+}
+
+function startBot(codeMode = false) {
+    const args = ['--expose-gc', CONNECT_FILE];
+    if (codeMode) args.push('--code');
+
+    info(`📷 Iniciando com ${codeMode ? 'código de pareamento' : 'QR Code'}`);
+
+    botProcess = spawn('node', args, {
+        stdio: 'inherit',
+        env: { ...process.env, FORCE_COLOR: '1' },
     });
 
-    return Sock;
+    botProcess.on('error', (error) => {
+        aviso(`❌ Erro ao iniciar o processo do bot: ${error.message}`);
+        restartBot(codeMode);
+    });
+
+    botProcess.on('close', (code) => {
+        if (code === 0) {
+            info(`✅ O bot terminou normalmente (código: ${code}). Reiniciando...`);
+        } else {
+            aviso(`⚠️ O bot terminou com erro (código: ${code}). Reiniciando...`);
+        }
+        restartBot(codeMode);
+    });
+
+    return botProcess;
 }
 
-startNazu();
-async function startNazu() {
-    await createBotSocket(AUTH_DIR);
+async function startQR() {
+    // Criação do QR Code para autenticação
+    const qr = await generateQRCode();
+    qrcode.generate(qr, { small: false }, (qrcodeText) => {
+        console.log(qrcodeText);
+    });
+    console.log('📱 Escaneie o QR code acima com o WhatsApp para autenticar o bot.');
 }
 
-export { rentalExpirationManager, messageQueue };
+async function generateQRCode() {
+    // Aqui você gera o código QR que será usado para a autenticação
+    // Em vez de gerar um arquivo, geramos direto no console
+    const { qr } = await import('whaileys');
+    return qr;
+}
+
+async function main() {
+    try {
+        setupGracefulShutdown();
+        await checkPrerequisites();
+        await setupTermuxAutostart();
+
+        startBot(false); // Começa com o QR Code
+    } catch (error) {
+        aviso(`❌ Erro inesperado: ${error.message}`);
+        process.exit(1);
+    }
+}
+
+(async () => {
+    await main();
+})();
