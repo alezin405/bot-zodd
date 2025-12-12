@@ -1,0 +1,14 @@
+{
+  "nomedono": "Zodd",
+  "numerodono": "555191297601",
+  "nomebot": "ZoddBot",
+  "prefixo": "/",
+  "mode": "public",
+  "antilink": false,
+  "autoread": true,
+  "antipv": false,
+  "antibot": false,
+  "antilinkhard": false,
+  "bemvindo": false,
+  "gpt": false
+}
